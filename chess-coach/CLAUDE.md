@@ -25,13 +25,14 @@ src/
       parseUci.ts      defensive UCI "info"/"bestmove" line parsing
       StockfishEngine.ts  one Worker per instance, internal command queue
       opponent.ts      bot move selection (placeholder in Phase 1)
+      moveQuality.ts   gradeMove(): cp-loss tagging + per-move accuracy (Phase 2)
       index.ts         public exports + STOCKFISH_WORKER_URL
     game/           # chess.js wrapper, framework-agnostic move helpers
       useChessGame.ts  React hook: fen/turn/history/gameOver + applyMove/reset
       uci.ts           UCI move string <-> {from,to,promotion}
   components/       # UI only. Never talk to the engine directly — go through lib/engine.
     ChessBoard.tsx
-  App.tsx           # phase-1 game screen: wires useChessGame + one engine instance
+  App.tsx           # game screen: wires useChessGame + two engine instances (opponent, analysis)
 public/
   engine/           # bundled Stockfish worker script + wasm (static, not processed by Vite)
 ```
@@ -47,10 +48,12 @@ Phase 3) `lib/opening` and (from Phase 4) `lib/coaching` — they never touch
   (`enqueue()`) so a caller can never accidentally interleave two
   `position`/`go` pairs on the same instance — each `analyze()` call waits
   for the previous one on that instance to finish.
-- Per the spec, **opponent-move analysis and coaching analysis will use two
-  separate `StockfishEngine` instances** (two Workers) once coaching lands in
-  Phase 4, rather than sharing one and depending on the queue for isolation.
-  Phase 1 only needs the opponent instance.
+- **Two `StockfishEngine` instances run side by side** (`App.tsx`): one plays
+  the opponent's moves at its configured Skill Level, the other is dedicated
+  to grading/analysis and is explicitly pinned to Skill Level 20 (full
+  strength) so coaching feedback is never distorted by the opponent's
+  artificial weakening. They never share a Worker, so the opponent thinking
+  and a grading request never interleave on the same UCI session.
 - `analyze(fen, { depth, multipv })` resolves with `EngineLine[]`, one entry
   per multipv slot, sorted ascending. `cpScore`/`mateIn` are from the
   perspective of the side to move (raw UCI convention) — anything that wants
@@ -61,8 +64,39 @@ Phase 3) `lib/opening` and (from Phase 4) `lib/coaching` — they never touch
   omitted when multipv=1). `pv` is assumed to run to the end of the line —
   true across all known builds — so parsing bails out and doesn't force a
   parse if a required field is missing.
-- Move quality tagging, accuracy %, and the second (coaching) engine instance
-  are Phase 2 work — not implemented yet.
+
+## Move quality & accuracy (Phase 2)
+
+- `gradeMove(engine, fenBefore, fenAfter, playedMoveUci, { depth, multipv })`
+  (`lib/engine/moveQuality.ts`) grades one played move:
+  1. Runs `analyze(fenBefore, { multipv: 3 })` to get the best line and a
+     handful of alternatives, all from the mover's perspective.
+  2. If the played move matches one of those multipv candidates, its eval is
+     read directly — no second search needed.
+  3. Otherwise it falls back to `analyze(fenAfter, { multipv: 1 })` (the
+     opponent's best reply) and negates that score back to the mover's
+     perspective. If there's no legal reply at all (the move ended the
+     game), it special-cases checkmate/stalemate via a throwaway chess.js
+     board rather than guessing from an empty engine result.
+  4. `cpLoss = bestEval - actualEval` (both mover-relative; mate scores are
+     mapped onto the same cp-like scale so they compare directly), which
+     drives the tag: **Best** ≤10, **Good** ≤49, **Inaccuracy** 50-99,
+     **Mistake** 100-249, **Blunder** 250+. The `Theory` tag exists in the
+     type but nothing produces it yet — that's wired up once the opening
+     database (Phase 3) can say a move is still book.
+  5. Per-move accuracy uses Lichess's published win%-swing formula
+     (`50 + 50·(2/(1+e^-0.00368208·cp) − 1)` for win%, then
+     `103.1668·e^-0.04354·Δwin% − 3.1668` clamped to [0,100]) rather than a
+     bespoke one — it's a known-reasonable curve and there's no reason to
+     invent a new one. The header's running "Accuracy" is a plain mean of
+     these per-move values, which is a simplification of Lichess's actual
+     volatility-weighted average; fine for now, revisit if the numbers feel
+     off in practice.
+- Grading only ever runs on the human player's moves (`App.tsx` calls it from
+  `handleUserMove`, never from the bot-move path) and runs in the background
+  against the dedicated analysis engine — it doesn't block the board or the
+  opponent's reply. Results land in React state keyed by ply index as each
+  grading promise resolves, so tags can appear a beat after the move is made.
 
 ## Known simplifications (revisit later)
 
@@ -77,7 +111,7 @@ Phase 3) `lib/opening` and (from Phase 4) `lib/coaching` — they never touch
 ## Build order (stop-and-play after each phase)
 
 1. **Done.** Board, chess.js, legal moves, one hardcoded Stockfish opponent.
-2. Engine service multipv, move quality tags, accuracy score. No LLM.
+2. **Done.** Engine service multipv, move quality tags, accuracy score. No LLM.
 3. Opening service: bundled ECO database, live name detection, book-exit detection (display only).
 4. Coaching panel, Reactive mode only, server-side Anthropic proxy, opening-idea explanations, LLM response cache in IndexedDB.
 5. Guided mode, blunder guard + one takeback, opening trap warnings.

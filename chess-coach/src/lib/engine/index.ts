@@ -3,6 +3,8 @@ export { parseInfoLine, parseBestMove } from './parseUci';
 export { getOpponentMove, PRACTICE_BOT } from './opponent';
 export type { OpponentConfig } from './opponent';
 export type { EngineLine, AnalyzeOptions } from './types';
+export { gradeMove } from './moveQuality';
+export type { MoveQuality, MoveQualityTag, GradeMoveOptions } from './moveQuality';
 
 /** Path to the bundled single-threaded Stockfish worker script, served from /public. */
 export const STOCKFISH_WORKER_URL = '/engine/stockfish-19-lite-single.js';
