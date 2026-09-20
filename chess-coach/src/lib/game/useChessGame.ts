@@ -64,9 +64,18 @@ export function useChessGame() {
     setState(deriveState(chessRef.current));
   }, []);
 
+  /** Pops up to `plies` half-moves off the end of the game. Stops early if it runs out. */
+  const undo = useCallback((plies: number = 1) => {
+    for (let i = 0; i < plies; i++) {
+      if (!chessRef.current.undo()) break;
+    }
+    setState(deriveState(chessRef.current));
+  }, []);
+
   return {
     ...state,
     applyMove,
     reset,
+    undo,
   };
 }

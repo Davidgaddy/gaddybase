@@ -14,6 +14,8 @@ export interface MoveQuality {
   bestMove: string;
   bestEvalCp: number | null;
   bestMateIn: number | null;
+  /** The full multipv result this grade was computed from (pre-move position, mover's perspective). */
+  candidates: EngineLine[];
 }
 
 /**
@@ -110,5 +112,6 @@ export async function gradeMove(
     bestMove: best?.move ?? playedMoveUci,
     bestEvalCp: best?.cpScore ?? null,
     bestMateIn: best?.mateIn ?? null,
+    candidates: beforeLines,
   };
 }
