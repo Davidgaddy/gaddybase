@@ -10,6 +10,7 @@ import {
 } from './lib/engine';
 import { parseUciMove } from './lib/game/uci';
 import { useChessGame } from './lib/game/useChessGame';
+import { useOpeningBook } from './lib/opening';
 
 const PLAYER_COLOR: 'w' | 'b' = 'w';
 
@@ -29,6 +30,7 @@ const TAG_STYLES: Record<MoveQuality['tag'], string> = {
 
 export default function App() {
   const game = useChessGame();
+  const book = useOpeningBook();
   const opponentEngineRef = useRef<StockfishEngine | null>(null);
   const analysisEngineRef = useRef<StockfishEngine | null>(null);
   const [opponentReady, setOpponentReady] = useState(false);
@@ -73,35 +75,51 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [opponentReady, game.fen, game.isGameOver, game.turn]);
 
-  const gradePlayerMove = useCallback((plyIndex: number, fenBefore: string, fenAfter: string, playedMoveUci: string) => {
-    const engine = analysisEngineRef.current;
-    if (!engine) return;
-    gradeMove(engine, fenBefore, fenAfter, playedMoveUci, {
-      depth: ANALYSIS_DEPTH,
-      multipv: ANALYSIS_MULTIPV,
-    })
-      .then((quality) => {
-        setMoveQualities((prev) => ({ ...prev, [plyIndex]: quality }));
+  const gradePlayerMove = useCallback(
+    (plyIndex: number, fenBefore: string, fenAfter: string, playedMoveUci: string, isBookMove: boolean) => {
+      const engine = analysisEngineRef.current;
+      if (!engine) return;
+      gradeMove(engine, fenBefore, fenAfter, playedMoveUci, {
+        depth: ANALYSIS_DEPTH,
+        multipv: ANALYSIS_MULTIPV,
       })
-      .catch(() => {
-        // Grading is best-effort; a failed analysis just leaves that move untagged.
-      });
-  }, []);
+        .then((quality) => {
+          // Book moves are known-sound by definition — tag them Theory rather
+          // than let a shallow-ish analysis depth call a standard theoretical
+          // move an "Inaccuracy" just because it isn't the engine's top pick.
+          const finalQuality: MoveQuality = isBookMove ? { ...quality, tag: 'Theory' } : quality;
+          setMoveQualities((prev) => ({ ...prev, [plyIndex]: finalQuality }));
+        })
+        .catch(() => {
+          // Grading is best-effort; a failed analysis just leaves that move untagged.
+        });
+    },
+    [],
+  );
 
   const handleUserMove = useCallback(
     (from: string, to: string) => {
       if (game.turn !== PLAYER_COLOR || botThinking) return false;
       const plyIndex = game.history.length;
+      const sanBefore = game.history.map((m) => m.san);
       const result = game.applyMove({ from, to, promotion: 'q' });
       if (!result) return false;
-      gradePlayerMove(plyIndex, result.before, result.after, result.lan);
+      const isBookMove = book ? !book.hasLeftBook([...sanBefore, result.san]) : false;
+      gradePlayerMove(plyIndex, result.before, result.after, result.lan, isBookMove);
       return true;
     },
-    [game, botThinking, gradePlayerMove],
+    [game, botThinking, gradePlayerMove, book],
   );
 
+  const sanHistory = useMemo(() => game.history.map((m) => m.san), [game.history]);
+  const opening = useMemo(() => (book ? book.identify(sanHistory) : null), [book, sanHistory]);
+  const leftBook = useMemo(() => (book ? book.hasLeftBook(sanHistory) : false), [book, sanHistory]);
+
   const accuracy = useMemo(() => {
-    const values = Object.values(moveQualities).map((q) => q.accuracy);
+    // Theory moves are known-sound by definition, so they're excluded rather than scored.
+    const values = Object.values(moveQualities)
+      .filter((q) => q.tag !== 'Theory')
+      .map((q) => q.accuracy);
     if (values.length === 0) return null;
     return values.reduce((sum, v) => sum + v, 0) / values.length;
   }, [moveQualities]);
@@ -117,7 +135,13 @@ export default function App() {
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center gap-6 py-8 px-4">
       <header className="text-center">
         <h1 className="text-2xl font-semibold tracking-tight">Chess Coach</h1>
-        <p className="text-sm text-slate-400">Phase 2: move quality + accuracy</p>
+        <p className="text-sm text-slate-400">Phase 3: opening detection</p>
+        {opening && (
+          <p className="mt-1 text-sm text-slate-300">
+            {opening.name} <span className="text-slate-500">({opening.eco})</span>
+            {leftBook && <span className="ml-2 text-amber-400">· out of book</span>}
+          </p>
+        )}
         {accuracy !== null && (
           <p className="mt-1 text-sm font-medium text-slate-200">
             Accuracy: <span className="text-emerald-400">{accuracy.toFixed(1)}%</span>

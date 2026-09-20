@@ -14,6 +14,7 @@ the app in a playable state before the next one starts.
 - Stockfish via the `stockfish` npm package (nmrugg/stockfish.js), **lite single-threaded build** (`stockfish-19-lite-single.js/.wasm`, ~1.8MB). Chosen deliberately over the full build (99MB wasm, multi-threaded, needs COOP/COEP) and over the plain single-threaded build (also ~99MB) — lite is still far stronger than any human, loads fast, and needs no cross-origin isolation headers. The engine files are copied into `public/engine/` (not imported through the bundler) and loaded via `new Worker('/engine/stockfish-19-lite-single.js')`.
 - Dexie (IndexedDB) — not yet added, lands in Phase 7 (persistence).
 - Anthropic API via a server-side proxy — not yet added, lands in Phase 4. The key must never reach the client bundle.
+- ECO opening database as a static JSON asset (`public/data/eco.json`, ~2.2MB, 15,999 entries). Sourced from the `JeffML/eco.json` project's raw per-category files (`ecoA-E.json` + `eco_interpolated.json`, MIT-licensed aggregation of ECO/SCID/Wikibooks/lichess-derived opening data — see https://github.com/JeffML/eco.json), fetched once during development and transformed into `{eco, name, moves}` records (dropped FEN keys, aliases, scid — not needed), deduplicated by move path preferring canonical `eco_tsv` sources over the gap-filling `interpolated` ones. It's a one-time data-prep step, not a runtime dependency or API call — the app only ever reads the bundled file.
 
 ## Directory layout
 
@@ -30,17 +31,25 @@ src/
     game/           # chess.js wrapper, framework-agnostic move helpers
       useChessGame.ts  React hook: fen/turn/history/gameOver + applyMove/reset
       uci.ts           UCI move string <-> {from,to,promotion}
+    opening/        # ECO database indexing. No engine calls, no React beyond one hook.
+      types.ts         OpeningEntry, OpeningIdentification, OpeningContinuation
+      OpeningBook.ts   trie over SAN move sequences; identify/hasLeftBook/continuations
+      loadOpeningBook.ts  fetches + parses public/data/eco.json once, memoized
+      useOpeningBook.ts   React hook wrapping the loader
+      index.ts         public exports
   components/       # UI only. Never talk to the engine directly — go through lib/engine.
     ChessBoard.tsx
-  App.tsx           # game screen: wires useChessGame + two engine instances (opponent, analysis)
+  App.tsx           # game screen: wires useChessGame + two engine instances + opening book
 public/
   engine/           # bundled Stockfish worker script + wasm (static, not processed by Vite)
+  data/
+    eco.json          # bundled ECO database (see "Stack" above for provenance)
 ```
 
 The rule going forward: **engine module, opening module, coaching module, and
-UI components are separate.** Components call into `lib/engine` and (from
-Phase 3) `lib/opening` and (from Phase 4) `lib/coaching` — they never touch
-`postMessage`/UCI or the Anthropic client directly.
+UI components are separate.** Components call into `lib/engine`, `lib/opening`,
+and (from Phase 4) `lib/coaching` — they never touch `postMessage`/UCI, the
+opening trie, or the Anthropic client directly.
 
 ## Engine service design
 
@@ -98,6 +107,47 @@ Phase 3) `lib/opening` and (from Phase 4) `lib/coaching` — they never touch
   opponent's reply. Results land in React state keyed by ply index as each
   grading promise resolves, so tags can appear a beat after the move is made.
 
+## Opening service (Phase 3)
+
+- `OpeningBook` (`lib/opening/OpeningBook.ts`) indexes all 15,999 entries into
+  a trie keyed by SAN move (from move 1). A trie node can exist without a
+  name — most real positions aren't themselves one of the database's *named*
+  entries, they're just on the way to one — so "in book" and "named" are
+  different questions:
+  - `identify(moveHistory)` walks the trie remembering the deepest node that
+    *did* carry a name, and reports it with its ply depth and whether that
+    name matches the current position exactly (`inBook`) or is a still-valid
+    but shallower match.
+  - `hasLeftBook(moveHistory)` is a pure walk: true the moment no trie node
+    matches the full move sequence at all. A position can be un-named and
+    still return `false` here (still in the book's move graph, just not a
+    distinctly named point yet).
+  - `continuations(moveHistory)` lists the current node's children; each only
+    carries a name/ECO when that specific next position is itself named
+    (otherwise theory just continues under whatever `identify` already
+    reports). Built for Phase 5+ (Guided mode framing, trap warnings) —
+    nothing renders it yet.
+- `App.tsx` derives `sanHistory` from `game.history`, calls `identify`/
+  `hasLeftBook` on every render via `useMemo`, and shows the name/ECO plus an
+  "out of book" flag in the header — this is the whole Phase 3 UI surface,
+  deliberately just display.
+- The `Theory` move-quality tag (typed in Phase 2, unused until now) is now
+  wired up: `handleUserMove` checks `!book.hasLeftBook([...sanBefore,
+  playedSan])` right when the move is made and overrides `gradeMove`'s tag to
+  `Theory` if so. This is a synchronous, free check (no engine call), so it
+  happens before the async grading promise even resolves. Theory-tagged
+  moves are excluded from the running accuracy average rather than scored,
+  matching the original spec ("book moves get tagged Theory instead of
+  scored") — a shallow-ish analysis depth calling a completely standard book
+  move an "Inaccuracy" just because it isn't the engine's single top pick
+  would be misleading, not helpful.
+- The book is fetched once (`loadOpeningBook.ts` memoizes the promise) and
+  built into the trie client-side; `useOpeningBook()` just re-renders once
+  it's ready. ~2.2MB fetched + parsed + indexed on load — fine for a
+  local-first single-user app, but if this ever needs to feel snappier on a
+  cold load, pre-building the trie into the JSON asset (instead of an array
+  of flat records) would remove the client-side index-build cost.
+
 ## Known simplifications (revisit later)
 
 - Pawn promotion always defaults to queen on drag-drop (`ChessBoard.tsx` /
@@ -112,7 +162,7 @@ Phase 3) `lib/opening` and (from Phase 4) `lib/coaching` — they never touch
 
 1. **Done.** Board, chess.js, legal moves, one hardcoded Stockfish opponent.
 2. **Done.** Engine service multipv, move quality tags, accuracy score. No LLM.
-3. Opening service: bundled ECO database, live name detection, book-exit detection (display only).
+3. **Done.** Opening service: bundled ECO database, live name detection, book-exit detection (display only).
 4. Coaching panel, Reactive mode only, server-side Anthropic proxy, opening-idea explanations, LLM response cache in IndexedDB.
 5. Guided mode, blunder guard + one takeback, opening trap warnings.
 6. Bot personalities with repertoires (picker-strategy interface, one file per bot), pre-game selection screen.
